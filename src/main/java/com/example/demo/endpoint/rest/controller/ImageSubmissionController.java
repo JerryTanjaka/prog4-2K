@@ -91,8 +91,7 @@ public class ImageSubmissionController {
             .orElseThrow(() -> new ImageSubmissionNotFoundException(id));
 
     if (submission.getBwBucketKey() == null) {
-      throw new BadRequestException(
-          "The black and white image is not ready yet for id=" + id);
+      throw new BadRequestException("The black and white image is not ready yet for id=" + id);
     }
 
     URL presignedUrl = bucketComponent.presign(submission.getBwBucketKey(), NOIR_URL_DURATION);
