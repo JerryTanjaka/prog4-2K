@@ -1,0 +1,222 @@
+═══════════════════════════════════════════════════════════════
+  MAILER + EVENT ASYNCHRONE - EXPLICATION COMPLÈTE (POJA)
+═══════════════════════════════════════════════════════════════
+
+1. SYNCHRONE vs ASYNCHRONE
+──────────────────────────
+
+  SYNCHRONE (mauvais pour email) :
+    Requête HTTP → Controller → Mailer → SES → (attend 2s) → Réponse
+    → L'utilisateur attend. Si SES ralentit, tout le monde attend.
+
+  ASYNCHRONE (POJA) :
+    Requête HTTP → Controller → eventProducer.accept(event) → Réponse immédiate
+                                   │
+                              [AWS EventBridge → SQS file d'attente]
+                                   │
+                          [Worker POJA lit la file plus tard]
+                                   │
+                   EventServiceInvoker → tonService.accept(event)
+                                              │
+                                          Mailer → SES
+
+    → L'utilisateur reçoit la réponse tout de suite.
+    → L'email part plus tard dans un worker séparé.
+    → Si SES plante, l'event reste dans SQS et réessaye automatiquement.
+
+
+2. LES TERMES
+─────────────
+
+  Event (Événement)
+    Un simple objet Java qui transporte des données.
+    Exemple : SaleConfirmedEvent { email="x@y.com", saleId="123" }
+    C'est un "Post-it" qui dit : "il faut faire quelque chose avec ces données"
+
+  EventProducer<T>
+    Classe NATIVE POJA. Prend ton événement et le met sur AWS EventBridge.
+    Tu l'utilises : eventProducer.accept(List.of(event))
+    Retour immédiat, n'attend pas.
+
+  EventBridge + SQS (AWS)
+    Infra cloud NATIVE POJA.
+    EventBridge = tableau où on épingle les Post-it
+    SQS = file d'attente. Les événements attendent leur tour d'être traités
+
+  Consumer<T>
+    Interface Java : java.util.function.Consumer
+    Une seule méthode : void accept(T t)
+    POJA cherche automatiquement les classes qui implémentent
+    Consumer<TonEvent> et les appelle dans un worker.
+
+  EventServiceInvoker
+    Classe NATIVE POJA.
+    Reçoit l'événement depuis SQS → regarde son type
+    → cherche un bean qui implements Consumer<CeType>
+    → appelle service.accept(event)
+
+  Worker
+    Thread séparé du serveur HTTP.
+    POJA en démarre plusieurs. Ils font du long polling sur SQS.
+    C'est eux qui exécutent ton service plus tard.
+
+  Mailer
+    Classe NATIVE POJA. Envoie les emails via AWS SES.
+    Tu passes un Email record (to, cc, bcc, subject, htmlBody, attachments)
+
+  SES (Simple Email Service)
+    Service AWS qui envoie les emails pour de vrai.
+
+
+3. LES FICHIERS NATIFS POJA (ne pas toucher)
+─────────────────────────────────────────────
+
+  src/main/java/com/exam/hei/
+    ├── mail/
+    │   ├── Email.java              (record Email)
+    │   ├── EmailConf.java          (config AWS SES)
+    │   ├── EmailAddressVerifier.java
+    │   └── Mailer.java             (envoi via SES)
+    │
+    ├── endpoint/event/
+    │   ├── EventProducer.java      (met les events sur EventBridge)
+    │   ├── EventConf.java
+    │   ├── EventStack.java
+    │   ├── consumer/
+    │   │   ├── EventConsumer.java   (lit SQS)
+    │   │   ├── EventServiceInvoker.java (trouve ton service)
+    │   │   └── model/
+    │   │       ├── ConsumableEvent.java
+    │   │       ├── ConsumableEventTyper.java
+    │   │       └── TypedEvent.java
+    │   └── model/
+    │       ├── PojaEvent.java       (base de tous les events)
+    │       └── ...
+    │
+    ├── file/bucket/
+    │   ├── BucketComponent.java    (upload S3 + presigned URL)
+    │   └── BucketConf.java
+    │
+    └── ...
+    ─── ...
+    ─── ...
+
+
+4. CE QUE TU CODES (3 fichiers max)
+─────────────────────────────────────
+
+  PATRON POUR N'IMPORTE QUEL SUJET :
+
+  a) Controller (reçoit la requête HTTP)
+  ───────────────────────────────────────
+  src/main/java/com/exam/hei/endpoint/rest/controller/TonController.java
+
+    @RestController
+    @AllArgsConstructor
+    public class TonController {
+        private final EventProducer<TonEvent> eventProducer;
+
+        @GetMapping("/hello")
+        public String hello(@RequestParam String to) {
+            eventProducer.accept(List.of(
+                TonEvent.builder().to(to).build()
+            ));
+            return "... world!";
+        }
+    }
+
+
+  b) Event (transporte les données)
+  ──────────────────────────────────
+  src/main/java/com/exam/hei/endpoint/event/model/TonEvent.java
+
+    @NoArgsConstructor @AllArgsConstructor
+    @Builder(toBuilder = true)
+    @Data @EqualsAndHashCode(callSuper = false) @ToString
+    public class TonEvent extends PojaEvent {
+        private String to;
+
+        @Override
+        public Duration maxConsumerDuration() {
+            return Duration.ofSeconds(45);
+        }
+        @Override
+        public Duration maxConsumerBackoffBetweenRetries() {
+            return Duration.ofSeconds(30);
+        }
+    }
+
+
+  c) EventService (exécute la logique)
+  ─────────────────────────────────────
+  src/main/java/com/exam/hei/service/event/TonEventService.java
+
+    @Service
+    @AllArgsConstructor
+    public class TonEventService implements Consumer<TonEvent> {
+        private final Mailer mailer;
+
+        @SneakyThrows
+        @Override
+        public void accept(TonEvent event) {
+            mailer.accept(new Email(
+                new InternetAddress(event.getTo()),
+                List.of(), List.of(),
+                "Subject", "<h1>Body</h1>", List.of()
+            ));
+        }
+    }
+
+
+5. TEMPLATE MAILPDF (déjà présent dans prog4exam)
+────────────────────────────────────────────────────
+
+  Si le sujet demande un PDF + email, utilise le template existant :
+
+  MailPdfEvent.java (src/main/java/.../endpoint/event/model/)
+    Champs : email, subject, pdfHtmlContent, emailHtmlContent, bucketKey
+    Le emailHtmlContent peut contenir {downloadUrl}
+    qui sera remplacé par l'URL S3 du PDF.
+
+  MailPdfEventService.java (src/main/java/.../service/event/)
+    Fait automatiquement :
+      1. Génère PDF depuis pdfHtmlContent (via PdfGenerator)
+      2. Upload sur S3 (via BucketComponent)
+      3. Remplace {downloadUrl} dans emailHtmlContent
+      4. Envoie l'email (via Mailer → SES)
+
+  PdfGenerator.java (src/main/java/.../mail/)
+    Convertit HTML → PDF avec OpenHTML-to-PDF
+
+
+6. RÉSUMÉ FLUX COMPLET
+───────────────────────
+
+  TEMPS 1 (instantané) :
+    Requête HTTP
+      → Controller (ton code)
+        → eventProducer.accept(List.of(event))
+          → EventBridge (NATIF)
+            → SQS file d'attente (NATIF)
+      → Réponse HTTP retournée (l'utilisateur a sa réponse)
+
+  TEMPS 2 (quelques secondes plus tard, dans un worker) :
+    EventConsumer (NATIF) lit SQS
+      → EventServiceInvoker (NATIF) trouve le service
+        → TonEventService (ton code) est appelé
+          → Mailer (NATIF) envoie via SES (AWS)
+            → Email livré au destinataire
+
+
+7. BONNES PRATIQUES POUR L'EXAMEN
+───────────────────────────────────
+
+  ✓ Commits propres : un par fichier ou par fonctionnalité
+  ✓ Nommage : {NomEvent} extends PojaEvent, {NomEvent}Service implements Consumer
+  ✓ Toujours mettre @Override sur maxConsumerDuration et maxConsumerBackoffBetweenRetries
+  ✓ package event.model pour les events
+  ✓ package service.event pour les services
+  ✓ Le controller peut être dans n'importe quel package rest.controller
+  ✓ Ne JAMAIS modifier les fichiers @PojaGenerated
+  ✓ .env à ne pas commit (déjà dans .gitignore)
+  ✓ build.gradle : vérifier que les dépendances sont là avant de coder
